@@ -1,0 +1,124 @@
+import cupy as cp
+
+class ChanVeseGPU:
+    def __init__(self, image: cp.array) -> None:
+        self.image = image
+
+    def init_level_set(self, image_shape: tuple):
+        yv = cp.arange(image_shape[0], dtype=cp.float32).reshape(
+            image_shape[0], 1)
+        xv = cp.arange(image_shape[1], dtype=cp.float32)
+        sf = cp.pi / 5
+        xv *= sf
+        yv *= sf
+        return cp.sin(yv) * cp.sin(xv)
+
+    def cv_heavyside(self, phi, eps=1.0):
+        return 0.5 * (1. + (2./cp.pi) * cp.arctan(phi/eps))
+
+    def cv_calculate_averages(self, Hphi):
+        H = Hphi
+        Hinv = 1. - H
+        Hsum = cp.sum(H)
+        Hinvsum = cp.sum(Hinv)
+        avg_inside = cp.sum(self.image * H)
+        avg_oustide = cp.sum(self.image * Hinv)
+        if Hsum != 0:
+            avg_inside /= Hsum
+        if Hinvsum != 0:
+            avg_oustide /= Hinvsum
+        return (avg_inside, avg_oustide)
+
+    def cv_difference_from_average_term(self, H, lambda1, lambda2):
+        (c1, c2) = self.cv_calculate_averages(H)
+        Hinv = 1. - H
+        return (lambda1 * (self.image-c1)**2 * H +
+                lambda2 * (self.image-c2)**2 * Hinv)
+
+    def cv_curvature(self, phi):
+        """Returns the 'curvature' of a level set 'phi'.
+        """
+        P = cp.pad(phi, 1, mode='edge')
+        fy = (P[2:, 1:-1] - P[:-2, 1:-1]) / 2.0
+        fx = (P[1:-1, 2:] - P[1:-1, :-2]) / 2.0
+        fyy = P[2:, 1:-1] + P[:-2, 1:-1] - 2*phi
+        fxx = P[1:-1, 2:] + P[1:-1, :-2] - 2*phi
+        fxy = .25 * (P[2:, 2:] + P[:-2, :-2] - P[:-2, 2:] - P[2:, :-2])
+        grad2 = fx**2 + fy**2
+        K = ((fxx*fy**2 - 2*fxy*fx*fy + fyy*fx**2) /
+             (grad2*cp.sqrt(grad2) + 1e-8))
+        return K
+
+    def cv_edge_length_term(self, phi, mu):
+        toret = self.cv_curvature(phi)
+        return mu * toret
+
+    def cv_energy(self, phi, mu, lambda1, lambda2):
+        H = self.cv_heavyside(phi)
+        avgenergy = self.cv_difference_from_average_term(H, lambda1, lambda2)
+        lenenergy = self.cv_edge_length_term(phi, mu)
+        return cp.sum(avgenergy) + cp.sum(lenenergy)
+
+    def cv_delta(self, x, eps=1.):
+        return eps / (eps**2 + x**2)
+
+    def cv_calculate_variation(self, phi, mu, lambda1, lambda2, dt):
+        """Returns the variation of level set 'phi' based on algorithm parameters.
+        """
+        eta = 1e-16
+        P = cp.pad(phi, 1, mode='edge')
+
+        phixp = P[1:-1, 2:] - P[1:-1, 1:-1]
+        phixn = P[1:-1, 1:-1] - P[1:-1, :-2]
+        phix0 = (P[1:-1, 2:] - P[1:-1, :-2]) / 2.0
+
+        phiyp = P[2:, 1:-1] - P[1:-1, 1:-1]
+        phiyn = P[1:-1, 1:-1] - P[:-2, 1:-1]
+        phiy0 = (P[2:, 1:-1] - P[:-2, 1:-1]) / 2.0
+
+        C1 = 1. / cp.sqrt(eta + phixp**2 + phiy0**2)
+        C2 = 1. / cp.sqrt(eta + phixn**2 + phiy0**2)
+        C3 = 1. / cp.sqrt(eta + phix0**2 + phiyp**2)
+        C4 = 1. / cp.sqrt(eta + phix0**2 + phiyn**2)
+
+        K = (P[1:-1, 2:] * C1 + P[1:-1, :-2] * C2 +
+             P[2:, 1:-1] * C3 + P[:-2, 1:-1] * C4)
+
+        Hphi = 1 * (phi > 0)
+        (c1, c2) = self.cv_calculate_averages(Hphi)
+
+        difference_from_average_term = (- lambda1 * (self.image-c1)**2 +
+                                        lambda2 * (self.image-c2)**2)
+        new_phi = (phi + (dt*self.cv_delta(phi)) *
+                   (mu*K + difference_from_average_term))
+        return new_phi / (1 + mu * dt * self.cv_delta(phi) * (C1+C2+C3+C4))
+
+    def segment(self, tol=1e-3, mu=0.25, lambda1=1.0, lambda2=1.0, max_num_iter=500, dt=0.5):
+        phi = self.init_level_set(self.image.shape)
+        self.image = self.image - cp.min(self.image)
+        if cp.max(self.image) != 0:
+            self.image = self.image / cp.max(self.image)
+        i = 0
+        old_energy = self.cv_energy(phi, mu, lambda1, lambda2)
+        energies = []
+        phivar = tol + 1
+        segmentation = phi > 0
+        while (phivar > tol and i < max_num_iter):
+            # Save old level set values
+            oldphi = phi
+
+            # Calculate new level set
+            phi = self.cv_calculate_variation(phi, mu, lambda1, lambda2, dt)
+            # phi = _cv_reset_level_set(phi)
+            phivar = cp.sqrt(((phi-oldphi)**2).mean())
+
+            # Extract energy and compare to previous level set and
+            # segmentation to see if continuing is necessary
+            segmentation = phi > 0
+            new_energy = self.cv_energy(phi, mu, lambda1, lambda2)
+
+            # Save old energy values
+            energies.append(old_energy)
+            old_energy = new_energy
+            i += 1
+        return segmentation
